@@ -1,7 +1,8 @@
-name: BTC × Qimen Daily Report
+name: BTC × Qimen Daily Report (Zero-Dependency)
+
 on:
   schedule:
-    # 08:10 KST == 23:10 UTC (전날)
+    # 08:10 KST = 23:10 UTC (전날)
     - cron: '10 23 * * *'
   workflow_dispatch:
 
@@ -10,16 +11,189 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install dependencies
+
+      - name: Fetch 1h klines (UTC) from Binance
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Run agent
-        run: python run_daily.py
-      - name: Upload report artifact
+          mkdir -p work Reports
+          # 최근 70일치 정도를 1시간봉으로 수집 (3회 분할)
+          NOW_UTC=$(date -u +%s)
+          START=$((NOW_UTC - 70*24*3600))
+          MID=$((START + 30*24*3600))
+          curl -s "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&startTime=$((START*1000))" > work/part1.json
+          curl -s "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&startTime=$((MID*1000))"   > work/part2.json
+          # 마지막 구간(끝시간 지정 X)
+          curl -s "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h"                           > work/part3.json
+
+      - name: Build report (Python stdlib only)
+        env:
+          TZ: Asia/Seoul
+        run: |
+          python - <<'PY'
+          import json, math, os
+          from datetime import datetime, timedelta, timezone
+          KST = timezone(timedelta(hours=9))
+
+          def load_parts():
+              rows=[]
+              for p in ["work/part1.json","work/part2.json","work/part3.json"]:
+                  if not os.path.exists(p): continue
+                  try:
+                      arr = json.load(open(p))
+                      for k in arr:
+                          # kline format: [openTime, open, high, low, close, volume, closeTime, ...]
+                          ts = int(k[0])//1000  # seconds UTC
+                          close = float(k[4])
+                          rows.append((ts, close))
+                  except Exception:
+                      pass
+              rows.sort()
+              return rows
+
+          rows = load_parts()
+          if not rows:
+              today = datetime.now(tz=KST).date()
+              open(f"Reports/report_{today}.txt","w",encoding="utf-8").write(
+                  f"[Fallback] {today} (KST)\n데이터 수집 실패. 내일 다시 시도.\n"
+              )
+              raise SystemExit(0)
+
+          # UTC->KST, 1h -> 일봉 종가(24:00 KST) 재집계
+          from collections import OrderedDict
+          by_day = OrderedDict()
+          for ts, close in rows:
+              dt_kst = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(KST)
+              day = dt_kst.date()
+              key = day
+              by_day[key] = close  # 같은 날이면 마지막(=하루 끝 가까운 시각)이 종가처럼 남음
+
+          days = sorted(by_day.keys())
+          closes = [by_day[d] for d in days]
+
+          # 수익률/RSI(14)
+          rets = [None]
+          for i in range(1,len(closes)):
+              rets.append((closes[i]/closes[i-1]-1.0))
+          def rsi14(vals):
+              if len(vals)<15: return [None]*len(vals)
+              out=[None]*len(vals)
+              for i in range(len(vals)):
+                  if i<14: continue
+                  gains = [max(vals[j]-vals[j-1],0.0) for j in range(i-13, i+1)]
+                  losses= [max(vals[j-1]-vals[j],0.0) for j in range(i-13, i+1)]
+                  avg_g = sum(gains)/14.0
+                  avg_l = sum(losses)/14.0 or 1e-12
+                  rs = avg_g/avg_l
+                  out[i] = 100 - (100/(1+rs))
+              return out
+          rsi = rsi14(closes)
+
+          # 오늘/어제
+          today = datetime.now(tz=KST).date()
+          yday  = today - timedelta(days=1)
+
+          # rsi_sig
+          def rsi_sig_val(x):
+              if x is None: return 0
+              return 1 if x>55 else (-1 if x<45 else 0)
+
+          # 간지/오행/문 (앵커: 2025-10-20 = 壬戌)
+          HEAVENLY="甲乙丙丁戊己庚辛壬癸"; EARTHLY="子丑寅卯辰巳午未申酉戌亥"
+          ELEM_OF={"甲":"wood","乙":"wood","丙":"fire","丁":"fire","戊":"earth","己":"earth","庚":"metal","辛":"metal","壬":"water","癸":"water"}
+          GATES=list("開休生傷杜景死驚")
+          def ganji_for(d):
+              from datetime import date as D
+              anchor_h, anchor_e = "壬","戌"
+              anchor_date = datetime(2025,10,20,tzinfo=KST).date()
+              delta=(d-anchor_date).days
+              h = HEAVENLY[(HEAVENLY.index(anchor_h)+delta)%10]
+              e = EARTHLY[(EARTHLY.index(anchor_e)+delta)%12]
+              return h+e
+          def elements(ganji):
+              stem, branch = ganji[0], ganji[1]
+              base={"wood":.18,"fire":.18,"earth":.18,"metal":.18,"water":.18}
+              dom=ELEM_OF.get(stem)
+              if dom: base[dom]+=.12
+              if branch in "子亥": base["water"]+=.04
+              if branch in "寅卯": base["wood"] +=.04
+              if branch in "巳午": base["fire"] +=.04
+              if branch in "申酉": base["metal"]+=.04
+              if branch in "辰戌丑未": base["earth"]+=.04
+              s=sum(base.values())
+              for k in base: base[k]=round(base[k]/s,4)
+              return base
+          def gate_of(ganji):
+              return GATES[(ord(ganji[0])+ord(ganji[1]))%len(GATES)]
+          GATE_BIAS={"開": .05,"休": .02,"生": .03,"傷":-.03,"杜":-.02,"景": .01,"死":-.05,"驚":-.04}
+
+          # 최근 30일 온라인 로지스틱(간단)
+          W={k:0.0 for k in ["wood","fire","earth","metal","water"]}; BIAS=0.0; LR=0.06
+          EMA=0.5; ALPHA=0.2
+          def prob(logit): return 1/(1+math.exp(-logit))
+
+          # 학습용 데이터 구성
+          day_to_idx={d:i for i,d in enumerate(days)}
+          def row_for(d):
+              gan = ganji_for(d); ele=elements(gan); gate=gate_of(gan)
+              idx = day_to_idx.get(d)
+              rsiv = rsi[idx] if idx is not None else None
+              sig = rsi_sig_val(rsiv)
+              ret = rets[idx] if idx is not None else None
+              return {"date":d,"ele":ele,"gate":gate,"rsi_sig":sig,"ret":ret}
+
+          train_days=[d for d in days if d<today][-30:]
+          for d in train_days:
+              r=row_for(d)
+              if r["ret"] is None: continue
+              s = BIAS + sum(W[k]*r["ele"][k] for k in W) + GATE_BIAS.get(r["gate"],0.0) + 0.1*r["rsi_sig"]
+              p = prob(s); y = 1.0 if r["ret"]>0 else 0.0
+              grad = (p-y)
+              BIAS -= LR*grad*0.2
+              for k in W: W[k] -= LR*grad*r["ele"][k]
+              hit = (p>=0.5)==(y==1.0)
+              EMA = (1-ALPHA)*EMA + ALPHA*(1.0 if hit else 0.0)
+
+          # 오늘 예측
+          rt = row_for(today)
+          s_today = BIAS + sum(W[k]*rt["ele"][k] for k in W) + GATE_BIAS.get(rt["gate"],0.0) + 0.1*rt["rsi_sig"]
+          p_today = prob(s_today)
+          lbl_pred = "상승" if p_today>=0.5 else "하락"
+
+          # 전일 실제
+          actual = None
+          if yday in day_to_idx and rets[day_to_idx[yday]] is not None:
+              actual = "상승" if rets[day_to_idx[yday]]>0 else "하락"
+
+          # 리포트 생성
+          wood,fire,earth,metal,water = [rt["ele"][k] for k in ["wood","fire","earth","metal","water"]]
+          rsi_last = None
+          if days and days[-1] in day_to_idx:
+              rsi_last = rsi[day_to_idx[days[-1]]]
+          rsisig = rt["rsi_sig"]
+
+          lines=[]
+          lines.append(f"[BTC × 기문‧오행 일일 리포트] {today} (KST)")
+          lines.append(f"🔹 예측 대상일: {today}")
+          lines.append(f"🔹 검증 대상일: {yday}")
+          lines.append(f"🌿 오행지수: 木{wood:.2f} 火{fire:.2f} 土{earth:.2f} 金{metal:.2f} 水{water:.2f} · 門:{rt['gate']}")
+          lines.append(f"📈 RSI14: {('N/A' if rsi_last is None else f'{rsi_last:.1f}')} · 보조시그널: {rsisig}")
+          lines.append(f"🎯 오늘 예측: {lbl_pred} (확률 {p_today*100:.1f}%)")
+          if actual is None:
+              lines.append("🧪 전일 결과: 데이터 부족")
+          else:
+              hit = "적중 ✅" if ((p_today>=0.5 and actual=='상승') or (p_today<0.5 and actual=='하락')) else "빗나감 ❌"
+              lines.append(f"🧪 전일 결과: {actual} → {hit}")
+          ws = " ".join([f"{k}{W[k]:+0.02f}" for k in ["wood","fire","earth","metal","water"]])
+          lines.append(f"📊 EMA 적중률(최근 30일): {EMA*100:.1f}%")
+          lines.append(f"⚙️ 가중치: {ws} · bias:{BIAS:+0.02f} · lr:{LR}")
+          lines.append("🕐 규칙: KST 00:00–24:00, UTC→KST 보정, 月=中氣, 年=立春")
+
+          today_str=str(today)
+          os.makedirs("Reports", exist_ok=True)
+          open(f"Reports/report_{today_str}.txt","w",encoding="utf-8").write("\n".join(lines))
+          print("Report written: Reports/report_%s.txt" % today_str)
+          PY
+
+      - name: Upload report
         uses: actions/upload-artifact@v4
         with:
           name: daily-report
